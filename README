@@ -1,0 +1,205 @@
+## variables
+
+Those will be required.
+
+ * PGSQL_VIP - vip for PostgreSQL
+ * MAAS_REGIOND_VIP - vip for MAAS regiond on pxe line
+ * MAAS_REGIOND_VIP_EXT - vip for MAAS regiond on public line if any
+ * NODE1_IP_ADDRESS, NODE2_IP_ADDRESS, NODE3_IP_ADDRESS - each IP address
+ * NODE1_HOSTNAME, NODE2_HOSTNAME, NODE3_HOSTNAME - each hostname
+ * REPLICATION_PASSWORD - password for PostgreSQL replication user
+
+## Package installation
+
+Install PostgreSQL, corosync and pacemaker packages on all 3 infrastructure nodes.
+
+    $ sudo apt install postgresql corosync pacemaker
+
+Edit corosync.conf and copy it.
+
+    $ sudo cp -v corosync.conf /etc/corosync/corosync.conf
+
+Start corosync/pacemaker on all 3 infrastructure nodes.
+
+    $ sudo service corosync restart
+    $ sudo service pacemaker restart
+
+Make sure all 3 nodes are listed up as online in status after starting corosync/pacemaker on all 3 nodes.
+
+    $ sudo crm status
+
+Stop all PostgreSQL running on all 3 infrastructure nodes for now.
+
+    $ sudo service postgresql stop
+
+Disable auto start of PostgreSQL on all 3 infrastructure nodes to prevent unnecessary cluster disruptions on reboot.
+
+    $ echo manual | sudo tee /etc/postgresql/9.5/main/start.conf
+
+
+## Setup PostgreSQL replication
+
+Edit pg_hba.conf first.
+
+Write ACL as pg_hba.conf on all 3 infrastructure nodes.
+
+    $ sudo cp -v pg_hba.conf /etc/postgresql/9.5/main/pg_hba.conf
+
+Write postgresql.conf on all 3 infrastructure nodes for replication.
+
+    $ sudo cp -v postgresql.conf \
+        /etc/postgresql/9.5/main/postgresql.conf
+
+Prepare necessary directories and files on all 3 infrastructure nodes.
+
+    $ sudo install -o postgres -g postgres -m 0700 \
+        -d /var/lib/postgresql/9.5/main/pg_archive
+    $ sudo install -o postgres -g postgres -m 0700 \
+        -d /var/lib/postgresql/9.5/tmp
+    $ sudo install -o postgres -g postgres -m 0600 \
+        /dev/null /var/lib/postgresql/9.5/tmp/rep_mode.conf
+
+Start PostgreSQL only on the primary node.
+
+    $ sudo pg_ctlcluster 9.5 main start
+
+Create a replication user as “repuser” in PostgreSQL. You can specify arbitrary password here.
+
+    $ sudo -u postgres createuser \
+        -U postgres repuser \
+        -P -c 10 --replication
+
+Start the replication only on non-primary nodes.
+
+    $ sudo mv -v /var/lib/postgresql/9.5/main{,.old}
+
+    $ sudo -u postgres pg_basebackup \
+        -h <NODE1_IP_ADDRESS> \
+        -D /var/lib/postgresql/9.5/main \
+        -U repuser \
+        -v -P --xlog-method=stream
+
+
+## Enable PostgreSQL management with corosync/pacemaker
+
+Stop PostgreSQL on the primary node and double check no PostgreSQL is running anywhere.
+
+    $ sudo pg_ctlcluster 9.5 main stop
+
+
+Edit pgsql.crm. Please note that "node_list" should contain hostnames (uname -n) regardless you have DNS or not.
+
+Load crm configuration on 1 of 3 nodes.
+
+    $ sudo crm configure load update - < base.crm
+
+    $ sudo crm configure load update - < pgsql.crm
+
+Wait for a while until the master node will be chosen by corosync/pacemaker. You can watch the status by the following command.
+
+    $ sudo crm_mon -fAr
+
+
+## MAAS package installation
+
+After the master PostgreSQL node is chosen, install "maas" package only on the master node, please double check which one is master with the crm status.
+
+    $ sudo apt install maas jq
+
+Install only necessary packages on the remaining 2 nodes.
+
+    $ sudo apt install maas-common
+    $ sudo apt install maas-region-api maas-dns maas-rack-controller jq
+
+
+## Enable MAAS HA
+
+First, get maasdb password by executing the following command on the primary node.
+
+    $ sudo maas-region local_config_get --plain --database-pass
+
+Get MAAS secret string by executing the following command on the primary node.
+
+    $ sudo cat /var/lib/maas/secret; echo
+
+Execute the following commands on all 3 infrastructure nodes to update configuration to use vip endpoints.
+
+    $ sudo maas-region local_config_set \
+        --maas-url http://<MAAS_REGIOND_VIP>/MAAS \
+        --database-host <PGSQL_VIP> \
+        --database-name maasdb \
+        --database-user maas \
+        --database-pass <MAASDB_PASSWORD>
+
+    $ sudo maas-region edit_named_options \
+        --migrate-conflicting-options
+
+    $ sudo service bind9 restart
+    $ sudo service maas-regiond restart
+
+    $ sudo maas-rack register \
+        --url http://<MAAS_REGION_VIP>/MAAS \
+        --secret <MAAS_SECRET>
+
+Edit MAAS crm file.
+
+Load MAAS crm configuration.
+
+    $ sudo crm configure load update - < maas.crm
+
+You can watch the crm status by the following command.
+
+    $ sudo crm_mon -fAr -1
+
+
+## Expected status
+
+sudo crm_mon -fAr -1
+Last updated: Wed Apr 19 04:03:58 2017          Last change: Wed Apr 12 09:19:33 2017 by root via cibadmin on node01
+Stack: corosync
+Current DC: node02 (version 1.1.14-70404b0) - partition with quorum
+3 nodes and 15 resources configured
+
+Online: [ node01 node02 node03 ]
+
+Full list of resources:
+
+ Resource Group: grp_pgsql_vip
+     res_pgsql_vip      (ocf::heartbeat:IPaddr2):       Started node03
+ Master/Slave Set: ms_pgsql [res_pgsql]
+     Masters: [ node03 ]
+     Slaves: [ node01 node02 ]
+ Resource Group: grp_regiond_vip
+     res_regiond_vip    (ocf::heartbeat:IPaddr2):       Started node01
+     res_regiond_vip_ext        (ocf::heartbeat:IPaddr2):       Started node01
+ Clone Set: cl_apache2 [res_apache2]
+     Started: [ node01 node02 node03 ]
+ Clone Set: cl_bind9 [res_bind9]
+     Started: [ node01 node02 node03 ]
+ Clone Set: cl_maas-regiond [res_maas-regiond]
+     Started: [ node01 node02 node03 ]
+
+Node Attributes:
+* Node node01:
+    + master-res_pgsql                  : -INFINITY 
+    + res_pgsql-data-status             : STREAMING|ASYNC
+    + res_pgsql-receiver-status         : normal    
+    + res_pgsql-status                  : HS:async  
+* Node node02:
+    + master-res_pgsql                  : 100       
+    + res_pgsql-data-status             : STREAMING|SYNC
+    + res_pgsql-receiver-status         : normal    
+    + res_pgsql-status                  : HS:sync   
+    + res_pgsql-xlog-loc                : 0000000006000060
+* Node node03:
+    + master-res_pgsql                  : 1000      
+    + res_pgsql-data-status             : LATEST    
+    + res_pgsql-master-baseline         : 0000000004000000
+    + res_pgsql-receiver-status         : normal (master)
+    + res_pgsql-status                  : PRI       
+    + res_pgsql-xlog-loc                : 0000000004000000
+
+Migration Summary:
+* Node node02:
+* Node node03:
+* Node node01:

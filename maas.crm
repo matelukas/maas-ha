@@ -1,0 +1,30 @@
+primitive res_regiond_vip ocf:heartbeat:IPaddr2 \
+    params ip=<MAAS_REGIOND_VIP> cidr_netmask=32 \
+    op monitor interval=10s
+primitive res_regiond_vip_ext ocf:heartbeat:IPaddr2 \
+    params ip=<MAAS_REGIOND_VIP_EXT> cidr_netmask=32 \
+    op monitor interval=10s
+group grp_regiond_vip \
+    res_regiond_vip \
+    res_regiond_vip_ext
+
+primitive res_maas-regiond systemd:maas-regiond \
+    op start interval=0 timeout=120s \
+    op monitor interval=10s timeout=120s \
+    op stop interval=0 timeout=120s
+clone cl_maas-regiond res_maas-regiond
+primitive res_apache2 systemd:apache2 \
+    op start interval=0 timeout=120s \
+    op monitor interval=10s timeout=120s \
+    op stop interval=0 timeout=120s
+clone cl_apache2 res_apache2
+primitive res_bind9 systemd:bind9 \
+    op start interval=0 timeout=120s \
+    op monitor interval=10s timeout=120s \
+    op stop interval=0 timeout=120s
+clone cl_bind9 res_bind9
+
+colocation col_regiond_vip_regiond inf: grp_regiond_vip cl_maas-regiond
+colocation col_regiond_vip_apache2 inf: grp_regiond_vip cl_apache2
+colocation col_regiond_vip_bind9 inf: grp_regiond_vip cl_bind9
+
